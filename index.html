@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Private Vault — GitHub + Vercel</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }
+    .box { max-width: 720px; margin: 0 auto; background: #1e293b; padding: 24px; border-radius: 12px; border: 1px solid #334155; }
+    h1 { margin-top: 0; font-size: 20px; }
+    label { display: block; margin-top: 12px; font-size: 13px; color: #cbd5e1; }
+    input, button { width: 100%; box-sizing: border-box; margin-top: 6px; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569; font-size: 14px; }
+    input { background: #0f172a; color: #fff; }
+    button { background: #2563eb; color: #fff; border: none; font-weight: 600; cursor: pointer; margin-top: 14px; }
+    button:hover { background: #1d4ed8; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .log { margin-top: 16px; background: #090d16; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 12px; white-space: pre-wrap; max-height: 220px; overflow: auto; }
+    .list { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
+    .item { display: flex; justify-content: space-between; align-items: center; background: #0f172a; padding: 10px 12px; border-radius: 8px; font-size: 13px; }
+    .item button { width: auto; margin: 0; padding: 6px 12px; font-size: 12px; background: #059669; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>🔐 Himoyalangan Bulut Ombor (GitHub + Vercel)</h1>
+
+    <div class="row">
+      <div>
+        <label>Shifrlash paroli (AES-GCM)</label>
+        <input type="password" id="encPassword" placeholder="Maxfiy parol..." />
+      </div>
+      <div>
+        <label>Kirish PIN (ixtiyoriy, ACCESS_PIN bo'lsa)</label>
+        <input type="password" id="accessPin" placeholder="PIN kod..." />
+      </div>
+    </div>
+
+    <label>Fayl tanlash (3 MB bo'laklarga bo'linib shifrlanadi)</label>
+    <input type="file" id="fileInput" />
+    <button id="uploadBtn">Shifrlab GitHub'ga yuklash</button>
+
+    <button id="refreshBtn" style="background:#334155;">Yuklangan manifestlarni ko'rish</button>
+    <div id="fileList" class="list"></div>
+    <div id="log" class="log">Tayyor.</div>
+  </div>
+
+  <script>
+    const CHUNK_SIZE = 3 * 1024 * 1024; // 3 MB (Vercel payload chegarasiga mos)
+    const logEl = document.getElementById("log");
+    const listEl = document.getElementById("fileList");
+
+    const log = (msg) => {
+      logEl.textContent += "\n" + msg;
+      logEl.scrollTop = logEl.scrollHeight;
+    };
+
+    const getHeaders = () => {
+      const h = { "Content-Type": "application/json" };
+      const pin = document.getElementById("accessPin").value.trim();
+      if (pin) h["x-access-pin"] = pin;
+      return h;
+    };
+
+    async function deriveKey(password, saltBytes) {
+      const enc = new TextEncoder();
+      const baseKey = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+      return crypto.subtle.deriveKey(
+        { name: "PBKDF2", salt: saltBytes, iterations: 150000, hash: "SHA-256" },
+        baseKey,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["encrypt", "decrypt"]
+      );
+    }
+
+    async function encryptBuffer(plainBuffer, password) {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const key = await deriveKey(password, salt);
+      const cipherBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plainBuffer);
+      const cipherBytes = new Uint8Array(cipherBuf);
+
+      const out = new Uint8Array(16 + 12 + cipherBytes.length);
+      out.set(salt, 0);
+      out.set(iv, 16);
+      out.set(cipherBytes, 28);
+      return out;
+    }
+
+    async function decryptBytes(packedBytes, password) {
+      const salt = packedBytes.slice(0, 16);
+      const iv = packedBytes.slice(16, 28);
+      const cipherBytes = packedBytes.slice(28);
+      const key = await deriveKey(password, salt);
+      return crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipherBytes);
+    }
+
+    function bytesToBase64(bytes) {
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      }
+      return btoa(bin);
+    }
+
+    function base64ToBytes(b64) {
+      const bin = atob(b64.replace(/\n/g, ""));
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+
+    async function uploadBlob(path, bytes) {
+      const res = await fetch("/api/vault", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ path, contentBase64: bytesToBase64(bytes) }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Yuklash xatosi");
+      return data;
+    }
+
+    document.getElementById("uploadBtn").addEventListener("click", async () => {
+      const password = document.getElementById("encPassword").value;
+      const file = document.getElementById("fileInput").files[0];
+      if (!password) return alert("Avval shifrlash parolini kiriting!");
+      if (!file) return alert("Fayl tanlang!");
+
+      try {
+        log(`"${file.name}" (${file.size} bayt) shifrlanmoqda...`);
+        const hashBuf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(file.name + ":" + file.size + ":" + Date.now()));
+        const fileId = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+
+        const chunks = [];
+        let index = 0;
+        for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
+          const sliceBuf = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
+          const encBytes = await encryptBuffer(sliceBuf, password);
+          const partPath = `vault/${fileId}/part_${String(index).padStart(4, "0")}.enc`;
+          await uploadBlob(partPath, encBytes);
+          chunks.push(partPath);
+          log(`[+] Bo'lak ${index + 1} yuklandi -> ${partPath}`);
+          index++;
+        }
+
+        const manifest = { originalName: file.name, size: file.size, chunks };
+        const encManifest = await encryptBuffer(new TextEncoder().encode(JSON.stringify(manifest)), password);
+        const indexPath = `vault/index_${fileId}.json.enc`;
+        await uploadBlob(indexPath, encManifest);
+        log(`[OK] Tayyor! Manifest: ${indexPath}`);
+        await loadManifests();
+      } catch (e) {
+        log("[XATO] " + e.message);
+      }
+    });
+
+    async function loadManifests() {
+      listEl.innerHTML = "";
+      const pin = encodeURIComponent(document.getElementById("accessPin").value.trim());
+      const res = await fetch(`/api/vault?path=vault${pin ? `&pin=${pin}` : ""}`);
+      const data = await res.json();
+      if (!res.ok) return log("[XATO] " + (data.error || "Ro'yxatni olib bo'lmadi"));
+
+      const indices = (data.items || []).filter(i => i.name.startsWith("index_") && i.name.endsWith(".json.enc"));
+      if (!indices.length) {
+        listEl.innerHTML = "<div class='item'>Hali shifrlangan fayllar yo'q.</div>";
+        return;
+      }
+
+      indices.forEach(item => {
+        const div = document.createElement("div");
+        div.className = "item";
+        div.innerHTML = `<span>${item.name}</span><button>Yuklab olish va ochish</button>`;
+        div.querySelector("button").onclick = () => restoreFile(item.path);
+        listEl.appendChild(div);
+      });
+    }
+
+    async function restoreFile(indexPath) {
+      const password = document.getElementById("encPassword").value;
+      if (!password) return alert("Shifrni yechish uchun parolni kiriting!");
+      try {
+        log(`Manifest o'qilmoqda: ${indexPath}`);
+        const pin = encodeURIComponent(document.getElementById("accessPin").value.trim());
+        const idxRes = await fetch(`/api/vault?path=${encodeURIComponent(indexPath)}${pin ? `&pin=${pin}` : ""}`);
+        const idxData = await idxRes.json();
+        if (!idxRes.ok) throw new Error(idxData.error);
+
+        let b64 = idxData.content;
+        if (!b64 && idxData.download_url) {
+          const rawRes = await fetch(idxData.download_url);
+          b64 = await rawRes.text();
+        }
+        const manifestPlain = await decryptBytes(base64ToBytes(b64), password);
+        const manifest = JSON.parse(new TextDecoder().decode(manifestPlain));
+
+        const parts = [];
+        for (let i = 0; i < manifest.chunks.length; i++) {
+          const pPath = manifest.chunks[i];
+          const pRes = await fetch(`/api/vault?path=${encodeURIComponent(pPath)}${pin ? `&pin=${pin}` : ""}`);
+          const pData = await pRes.json();
+          if (!pRes.ok) throw new Error(pData.error);
+
+          let pB64 = pData.content;
+          if (!pB64 && pData.download_url) {
+            const rawP = await fetch(pData.download_url);
+            pB64 = await rawP.text();
+          }
+          const decPart = await decryptBytes(base64ToBytes(pB64), password);
+          parts.push(new Uint8Array(decPart));
+          log(`[+] Bo'lak ${i + 1}/${manifest.chunks.length} shifri yechildi`);
+        }
+
+        const blob = new Blob(parts, { type: "application/octet-stream" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = manifest.originalName;
+        a.click();
+        URL.revokeObjectURL(url);
+        log(`[OK] Fayl tiklandi va yuklab olindi: ${manifest.originalName}`);
+      } catch (e) {
+        log("[XATO] Shifrni yechib bo'lmadi yoki xato: " + e.message);
+      }
+    }
+
+    document.getElementById("refreshBtn").addEventListener("click", loadManifests);
+  </script>
+</body>
+</html>
